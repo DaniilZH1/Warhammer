@@ -9,6 +9,13 @@ cover_tiles = [
     (5, 5)
 ]
 
+objective_tiles = [
+    (4, 4),
+    (4, 5),
+    (5, 4),
+    (5, 5)
+]
+
 def draw_grid(screen):
 
     for x in range(GRID_SIZE):
@@ -26,6 +33,9 @@ def draw_grid(screen):
 
             if (x, y) in cover_tiles:
                 tile_color = (120, 180, 120)
+
+            if (x, y) in objective_tiles:
+                tile_color = (220, 180, 60)
 
             pygame.draw.rect(
                 screen,
@@ -56,7 +66,7 @@ def draw_movement_range(screen, unit):
                     pygame.SRCALPHA
                 )
 
-                surface.fill((50, 100, 255, 80))
+                surface.fill((50, 100, 255, 40))
 
                 screen.blit(
                     surface,
