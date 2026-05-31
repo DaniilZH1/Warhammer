@@ -1,553 +1,448 @@
-import pygame
+﻿import pygame
 import sys
 
-from settings import *
-from unit import Unit
-from combat import (
-    attack,
-    attempt_charge,
-    combat_log,
-    dice_log,
-    dice_to_symbol,
-    hit_chance,
-    is_engaged,
-    log_event,
-    melee_attack,
-    save_chance,
-    wound_chance,
-)
+# импорт ботов
+from ai import ai_take_turn_step
+from app_settings import load_app_settings, save_app_settings
 from board import (
     draw_attack_range,
     draw_grid,
+    draw_invalid_targets,
     draw_movement_range,
-    objective_tiles,
+    draw_objective_indicators,
+    draw_target_range,
+    pixel_to_hex,
 )
-from turn_manager import next_turn
+
+#импорт боевки и эффектов
+from combat import attack, is_engaged, log_event, melee_attack, set_dice_delay
+from effects import (
+    add_damage_text,
+    add_melee_effect,
+    add_shot_effect,
+    draw_effects,
+    draw_floating_texts,
+    update_effects,
+    update_floating_texts,
+)
+from game_state import ai_turn_delay_ms, charge_max_range, GameState
+from localization import role_label
+from rules import (
+    action_hint,
+    can_charge_target,
+    can_fight_target,
+    can_move_to,
+    can_shoot_target,
+    current_action_cost,
+    distance,
+    get_unit_at,
+    ready_units,
+    unit_action_status,
+    unit_can_act,
+)
+from settings import *
+from ui import (
+    next_phase_rect,
+    waaagh_rect,
+    draw_combat_log,
+    draw_dice_log,
+    draw_full_log_overlay,
+    draw_help_overlay,
+    draw_pause_menu,
+    draw_sidebar,
+    draw_start_screen,
+    draw_target_preview,
+    draw_turn_header,
+    draw_victory_screen,
+    get_sidebar_roster_unit_at,
+)
 
 pygame.init()
 
-screen = pygame.display.set_mode((WIDTH, HEIGHT))
-pygame.display.set_caption("Mini Warhammer")
+# отображение
+screen = pygame.display.set_mode((window_width, window_height))
+pygame.display.set_caption(f"Мини Warhammer v{version}")
 
-font = pygame.font.SysFont(None, 28)
-small_font = pygame.font.SysFont(None, 22)
+# Окно и шрифты создаются один раз. Arial выбран, чтобы кириллица в интерфейсе
+font = pygame.font.SysFont("arial", 28)
+small_font = pygame.font.SysFont("arial", 22)
 clock = pygame.time.Clock()
 
-NEXT_PHASE_RECT = pygame.Rect(GAME_WIDTH + 20, 92, 160, 32)
-WAAAGH_RECT = pygame.Rect(GAME_WIDTH + 20, 130, 160, 32)
-VICTORY_POINTS = 5
+app_settings = load_app_settings()
+set_dice_delay(app_settings["dice_delay_ms"])
+state = GameState(ai_orks_enabled=app_settings["ai_orks_enabled"])
+
+#  оболочка приложения
+start_screen_visible = True
+pause_menu_visible = False
 
 
-def create_units():
-    return [
-        Unit(1, 1, 1, "marines"),
-        Unit(1, 3, 1, "marines"),
-        Unit(8, 8, 2, "orks"),
-        Unit(8, 6, 2, "orks"),
-    ]
+def persist_ai_setting():
+    app_settings["ai_orks_enabled"] = state.ai_orks_enabled
+    save_app_settings(app_settings)
 
 
-units = create_units()
+def persist_dice_delay():
+    save_app_settings(app_settings)
 
-selected_unit = None
-hovered_target = None
-current_team = 1
-marine_vp = 0
-ork_vp = 0
-winner = None
+# Ограничение задержки кубиков
+def adjust_dice_delay(delta):
+    
+    app_settings["dice_delay_ms"] = app_settings["dice_delay_ms"] + delta
 
-phases = [
-    "MOVEMENT",
-    "SHOOTING",
-    "CHARGE",
-    "FIGHT",
-]
+    if app_settings["dice_delay_ms"] < 0:
+        app_settings["dice_delay_ms"] = 0
 
-current_phase_index = 0
-current_phase = phases[current_phase_index]
-waaagh_active = False
-waaagh_used = False
+    if app_settings["dice_delay_ms"] > 500:
+        app_settings["dice_delay_ms"] = 500
+
+    set_dice_delay(app_settings["dice_delay_ms"])
+    persist_dice_delay()
+    log_event(f"Задержка кубиков: {app_settings['dice_delay_ms']} мс")
 
 
 def reset_game():
-    global units, selected_unit, hovered_target, current_team
-    global marine_vp, ork_vp, current_phase_index, current_phase
-    global waaagh_active, waaagh_used, winner
-
-    units = create_units()
-    selected_unit = None
-    hovered_target = None
-    current_team = 1
-    marine_vp = 0
-    ork_vp = 0
-    current_phase_index = 0
-    current_phase = phases[current_phase_index]
-    waaagh_active = False
-    waaagh_used = False
-    winner = None
-    combat_log.clear()
-    dice_log.clear()
-    log_event("NEW GAME")
+    state.reset(ai_orks_enabled=state.ai_orks_enabled)
 
 
-def draw_ui_line(text, x, y, color=WHITE):
-    text = str(text)
+def toggle_ai():
+    state.ai_orks_enabled = not state.ai_orks_enabled
+    persist_ai_setting()
 
-    if len(text) > 18:
-        text = text[:15] + "..."
+    if state.ai_orks_enabled:
+        ai_text = "Вкл"
+    else:
+        ai_text = "Выкл"
 
-    screen.blit(
-        small_font.render(text, True, color),
-        (x, y),
-    )
-
-
-def draw_button(rect, label, enabled=True):
-    fill = (70, 70, 70) if enabled else (45, 45, 45)
-    outline = (160, 160, 160) if enabled else (90, 90, 90)
-    text_color = WHITE if enabled else (140, 140, 140)
-
-    pygame.draw.rect(screen, fill, rect, border_radius=4)
-    pygame.draw.rect(screen, outline, rect, 1, border_radius=4)
-
-    text = small_font.render(label, True, text_color)
-    screen.blit(
-        text,
-        (
-            rect.centerx - text.get_width() // 2,
-            rect.centery - text.get_height() // 2,
-        ),
-    )
+    log_event(f"AI орков: {ai_text}")
 
 
-def get_unit_at(x, y):
-    for unit in units:
-        if unit.x == x and unit.y == y:
-            return unit
-
-    return None
+def unit_name(unit):
+    return role_label(unit.role)
 
 
-def distance(x1, y1, x2, y2):
-    return abs(x1 - x2) + abs(y1 - y2)
+def log_damage_result(target, before_hp):
+    
+    damage = before_hp - target.hp
+
+    if damage < 0:
+        damage = 0
+
+    if damage > 0:
+        log_event(f"{unit_name(target)} Получает {damage} Урн")
+    else:
+        log_event("Без Урона")
+
+    return damage
 
 
-def count_objective_control(team):
-    total = 0
+def select_next_ready_unit(previous_unit=None):
+    state.selected_unit = None
 
-    for unit in units:
-        if unit.team != team:
+    for unit in state.units:
+        if unit == previous_unit:
             continue
 
-        if (unit.x, unit.y) in objective_tiles:
-            total += unit.models
+        if unit.team != state.current_team:
+            continue
 
-    return total
-
-
-def remove_dead_units():
-    for unit in units[:]:
-        if unit.hp <= 0 or unit.models <= 0:
-            units.remove(unit)
-
-
-def check_victory():
-    global winner
-
-    teams_alive = {unit.team for unit in units}
-
-    if len(teams_alive) == 1:
-        winner = teams_alive.pop()
-        log_event(f"TEAM {winner} WINS!")
-        return
-
-    if marine_vp >= VICTORY_POINTS:
-        winner = 1
-        log_event("MARINES WIN BY VP!")
-    elif ork_vp >= VICTORY_POINTS:
-        winner = 2
-        log_event("ORKS WIN BY VP!")
-
-
-def unit_can_act(unit):
-    return unit.ap > 0
-
-
-def mark_phase_action(unit):
-
-    if unit.ap <= 0:
-        unit.has_acted = True
-
-
-def score_objectives():
-    global marine_vp, ork_vp
-
-    marine_control = count_objective_control(1)
-    ork_control = count_objective_control(2)
-
-    if marine_control > ork_control:
-        marine_vp += 1
-        log_event("SPACE MARINES SCORE 1 VP!")
-    elif ork_control > marine_control:
-        ork_vp += 1
-        log_event("ORKS SCORE 1 VP!")
-
-    check_victory()
-
-
-def advance_phase():
-    global current_phase, current_phase_index, current_team
-    global selected_unit, waaagh_active
-
-    selected_unit = None
-
-    if winner:
-        return
-
-    if current_phase == "FIGHT":
-        score_objectives()
-        current_phase_index = 0
-        current_team = next_turn(current_team, units)
-        waaagh_active = False
-    else:
-        current_phase_index += 1
-
-    current_phase = phases[current_phase_index]
-    log_event(f"PHASE: {current_phase}")
-
-
-def activate_waaagh():
-    global waaagh_active, waaagh_used
-
-    if current_team != 2:
-        log_event("ONLY ORKS CAN WAAAGH!")
-        return
-
-    if waaagh_used:
-        log_event("WAAAGH ALREADY USED!")
-        return
-
-    waaagh_active = True
-    waaagh_used = True
-    log_event("WAAAAAGH!!!")
-
-
-def draw_sidebar():
-    pygame.draw.rect(
-        screen,
-        (40, 40, 40),
-        (GAME_WIDTH, 0, UI_WIDTH, HEIGHT),
-    )
-
-    draw_ui_line(
-        f"VP M:{marine_vp} O:{ork_vp}/{VICTORY_POINTS}",
-        GAME_WIDTH + 20,
-        15,
-        (255, 220, 100),
-    )
-
-    draw_ui_line(
-        f"TEAM {current_team}",
-        GAME_WIDTH + 20,
-        42,
-        WHITE,
-    )
-
-    draw_ui_line(
-        current_phase,
-        GAME_WIDTH + 20,
-        65,
-        (255, 220, 100),
-    )
-
-    draw_button(NEXT_PHASE_RECT, "NEXT PHASE", enabled=winner is None)
-    draw_button(
-        WAAAGH_RECT,
-        "WAAAGH",
-        enabled=winner is None and current_team == 2 and not waaagh_used,
-    )
-
-    if winner:
-        winner_name = "MARINES" if winner == 1 else "ORKS"
-        stats = [
-            f"{winner_name} WIN",
-            "",
-            "PRESS R",
-            "TO RESTART",
-        ]
-    elif selected_unit:
-        stats = [
-            selected_unit.faction.upper(),
-            f"MODELS: {selected_unit.models}",
-            f"HP: {selected_unit.hp}",
-            f"TGH: {selected_unit.toughness}",
-            f"SAVE: {selected_unit.armor_save}+",
-            f"AP: {selected_unit.ap}/{selected_unit.max_ap}"
-            "",
-            selected_unit.weapon.name.upper(),
-            f"ATK: {selected_unit.weapon.attacks}",
-            f"STR: {selected_unit.weapon.strength}",
-            f"AP: {selected_unit.weapon.ap}",
-            f"DMG: {selected_unit.weapon.damage}",
-            f"RANGE: {selected_unit.weapon.weapon_range}",
-        ]
-    else:
-        stats = [
-            "SELECT UNIT",
-            "",
-            "ENTER/NEXT",
-            "ADVANCES PHASE",
-        ]
-
-    for i, stat in enumerate(stats):
-        draw_ui_line(
-            stat,
-            GAME_WIDTH + 20,
-            178 + i * 22,
-            WHITE,
-        )
-
-
-def draw_target_preview():
-    if (
-        not selected_unit
-        or not hovered_target
-        or hovered_target.team == selected_unit.team
-    ):
-        return
-
-    hit = hit_chance(selected_unit.ballistic_skill)
-    wound = wound_chance(
-        selected_unit.weapon.strength,
-        hovered_target.toughness,
-    )
-    save = save_chance(hovered_target.armor_save)
-
-    pygame.draw.line(
-        screen,
-        (100, 100, 100),
-        (GAME_WIDTH + 10, 430),
-        (WIDTH - 10, 430),
-        2,
-    )
-
-    preview = [
-        "TARGET",
-        hovered_target.faction.upper(),
-        f"HIT: {hit}%",
-        f"WOUND: {wound}%",
-        f"SAVE: {save}%",
-        f"DMG: {selected_unit.weapon.damage}",
-    ]
-
-    for i, line in enumerate(preview):
-        draw_ui_line(
-            line,
-            GAME_WIDTH + 20,
-            455 + i * 22,
-            (255, 220, 100),
-        )
-
-
-def draw_combat_log():
-    log_y = 602
-
-    draw_ui_line("LOG", GAME_WIDTH + 20, log_y, WHITE)
-
-    for i, line in enumerate(combat_log[-6:]):
-        draw_ui_line(
-            line,
-            GAME_WIDTH + 20,
-            log_y + 25 + i * 22,
-            (210, 210, 210),
-        )
-
-
-def draw_dice_log():
-    dice_y = 760
-
-    draw_ui_line("DICE", GAME_WIDTH + 20, dice_y, WHITE)
-
-    for i, (roll_type, value) in enumerate(dice_log[-2:]):
-        draw_ui_line(
-            f"{roll_type}: {dice_to_symbol(value)}",
-            GAME_WIDTH + 20,
-            dice_y + 25 + i * 22,
-            WHITE,
-        )
-
-
-def draw_turn_header():
-    if winner:
-        winner_name = "SPACE MARINES" if winner == 1 else "ORKS"
-        screen.blit(
-            font.render(f"{winner_name} WIN!", True, (255, 220, 100)),
-            (20, 20),
-        )
-        screen.blit(
-            font.render("PRESS R TO RESTART", True, WHITE),
-            (20, 60),
-        )
-        return
-
-    if current_team == 1:
-        turn_text = "SPACE MARINES TURN"
-        turn_color = (100, 180, 255)
-    else:
-        turn_text = "ORKS TURN"
-        turn_color = (100, 255, 100)
-
-    screen.blit(font.render(turn_text, True, turn_color), (20, 20))
-    screen.blit(
-        font.render(f"PHASE: {current_phase}", True, (255, 220, 100)),
-        (20, 60),
-    )
-
-    if waaagh_active:
-        screen.blit(
-            font.render("WAAAGH ACTIVE", True, (100, 255, 100)),
-            (20, 100),
-        )
+        if unit_can_act(unit, state.current_phase):
+            state.selected_unit = unit
+            break
 
 
 def handle_board_click(grid_x, grid_y):
-    global selected_unit
-
-    if winner:
+    # клик по полю выбор своего отряда, движение, стрельба, натиск и ближний бой.
+    if state.winner:
         return
 
-    clicked_unit = get_unit_at(grid_x, grid_y)
+    clicked_unit = get_unit_at(state.units, grid_x, grid_y)
 
-    if clicked_unit and clicked_unit.team == current_team:
-        if unit_can_act(clicked_unit):
-            selected_unit = clicked_unit
+    if clicked_unit and clicked_unit.team == state.current_team:
+        if unit_can_act(clicked_unit, state.current_phase):
+            state.selected_unit = clicked_unit
+        elif clicked_unit.broken:
+            log_event("О!")
+        elif clicked_unit.ap < current_action_cost(state.current_phase):
+            log_event("Не хватает AP!")
         else:
-            log_event("UNIT ALREADY ACTED")
+            log_event("Отряд уже ходил в этой фазе")
 
         return
 
-    if not selected_unit:
+    if not state.selected_unit:
         return
-    
-    if selected_unit.ap <= 0:
 
-        log_event("NO AP LEFT!")
+    if state.selected_unit.ap < current_action_cost(state.current_phase):
+        log_event("Не хватает AP!")
+        state.selected_unit = None
+        return
 
+    if state.current_phase in state.selected_unit.acted_phases:
+        log_event("Отряд уже ходил в этой фазе")
+        state.selected_unit = None
         return
 
     dist = distance(
-        selected_unit.x,
-        selected_unit.y,
+        state.selected_unit.x,
+        state.selected_unit.y,
         grid_x,
         grid_y,
     )
 
     target = clicked_unit
 
-    if current_phase == "MOVEMENT":
-        if target:
+    if state.current_phase == "MOVEMENT":
+        # проверка движения что бы обходило препятсвия, и не проходит на занятые поля
+        if not can_move_to(state.selected_unit, grid_x, grid_y, state.units):
+            log_event("Слишком далеко!")
             return
 
-        if dist > selected_unit.move_range:
-            log_event("MOVE TOO FAR!")
-            return
+        old_x, old_y = state.selected_unit.x, state.selected_unit.y
+        state.selected_unit.x = grid_x
+        state.selected_unit.y = grid_y
+        state.selected_unit.start_move_animation(old_x, old_y, grid_x, grid_y)
+        log_event(f"{unit_name(state.selected_unit)} Идет на {grid_x},{grid_y}")
+        state.selected_unit.ap -= 1
 
-        selected_unit.x = grid_x
-        selected_unit.y = grid_y
+        if state.selected_unit.ap < 0:
+            state.selected_unit.ap = 0
 
-        selected_unit.ap -= 1
-        selected_unit.ap = max(0, selected_unit.ap)
-
-        mark_phase_action(selected_unit)
-
-        if selected_unit.ap <= 0:
-            selected_unit = None
+        state.mark_phase_action(state.selected_unit)
+        select_next_ready_unit(state.selected_unit)
         return
 
-    if not target or target.team == current_team:
+    if not target or target.team == state.current_team:
         return
-
-    if current_phase == "SHOOTING":
-        if is_engaged(selected_unit, units):
-            log_event("UNIT ENGAGED IN MELEE!")
+# чтобы стелять дальность, линия видимости и небыло ближнего боя
+    if state.current_phase == "SHOOTING":
+        if not can_shoot_target(state.selected_unit, target, state.units):
+            if is_engaged(state.selected_unit, state.units):
+                log_event("Отряд в ближнем бою!")
+            elif dist > state.selected_unit.weapon.weapon_range:
+                log_event("Цель далеко!")
             return
 
-        if dist > selected_unit.weapon.weapon_range:
-            log_event("TARGET OUT OF RANGE!")
-            return
-
+        before_hp = target.hp
+        add_shot_effect(state, state.selected_unit, target)
+        log_event(f"{unit_name(state.selected_unit)} Стреляет в {unit_name(target)}")
         attack(
-            selected_unit,
+            state.selected_unit,
             target,
-            waaagh=waaagh_active,
+            waaagh=state.waaagh_active,
+        )
+        add_damage_text(state, target, log_damage_result(target, before_hp))
+        state.selected_unit.ap -= 1
+
+        if state.selected_unit.ap < 0:
+            state.selected_unit.ap = 0
+
+        state.mark_phase_action(state.selected_unit)
+        state.remove_dead_units()
+        state.check_victory()
+        select_next_ready_unit(state.selected_unit)
+        return
+
+    if state.current_phase == "CHARGE":
+        
+        # ставит атакующего на соседний с целью поле.
+        if not can_charge_target(state.selected_unit, target, charge_max_range):
+            log_event("Цель вне дальности натиска!")
+            return
+
+        from combat import attempt_charge
+
+        old_x, old_y = state.selected_unit.x, state.selected_unit.y
+
+        log_event(f"{unit_name(state.selected_unit)} Идет в натиск на {unit_name(target)}")
+
+        if attempt_charge(state.selected_unit, target):
+            state.selected_unit.start_move_animation(
+                old_x,
+                old_y,
+                state.selected_unit.x,
+                state.selected_unit.y,
+                frames=18,
+            )
+            state.selected_unit.ap -= 2
+
+            if state.selected_unit.ap < 0:
+                state.selected_unit.ap = 0
+
+            state.mark_phase_action(state.selected_unit)
+            select_next_ready_unit(state.selected_unit)
+        return
+
+    if state.current_phase == "FIGHT":
+        # Ближний бой разрешен только по соседним поле.
+        if not can_fight_target(state.selected_unit, target):
+            log_event("Цель слишком далеко")
+            return
+
+        before_hp = target.hp
+        add_melee_effect(state, target)
+        log_event(f"{unit_name(state.selected_unit)} Дерется с {unit_name(target)}")
+        melee_attack(state.selected_unit, target)
+        add_damage_text(state, target, log_damage_result(target, before_hp))
+        state.selected_unit.ap -= 1
+
+        if state.selected_unit.ap < 0:
+            state.selected_unit.ap = 0
+
+        state.mark_phase_action(state.selected_unit)
+        state.remove_dead_units()
+        state.check_victory()
+        select_next_ready_unit(state.selected_unit)
+
+
+def draw_game():
+    # Кадр собирается слоями: поле, подсветки, юниты, эффекты, сайдбар
+    screen.fill(black)
+    draw_grid(screen)
+
+    mx, my = pygame.mouse.get_pos()
+    hovered_hex = pixel_to_hex(mx, my)
+
+    if hovered_hex:
+        hover_x, hover_y = hovered_hex
+    else:
+        hover_x = -1
+        hover_y = -1
+
+    state.hovered_target = get_unit_at(state.units, hover_x, hover_y)
+    state.action_hint = "SELECT UNIT"
+
+    if state.selected_unit and mx < game_width:
+        # Подсказка в панели ACTION считается от текущего наведения мыши.
+        state.action_hint = action_hint(
+            state.selected_unit,
+            state.hovered_target,
+            hover_x,
+            hover_y,
+            state.current_phase,
+            state.units,
+            charge_max_range,
         )
 
-        selected_unit.ap -= 1
-        selected_unit.ap = max(0, selected_unit.ap)
+    if state.selected_unit and unit_can_act(state.selected_unit, state.current_phase):
+        
+        if state.current_phase == "MOVEMENT":
+            draw_movement_range(screen, state.selected_unit, state.units)
+        elif state.current_phase == "SHOOTING":
+            if not is_engaged(state.selected_unit, state.units):
+                valid_targets = []
 
-        mark_phase_action(selected_unit)
+                for unit in state.units:
+                    if can_shoot_target(state.selected_unit, unit, state.units):
+                        valid_targets.append(unit)
 
-        if selected_unit.ap <= 0:
-            selected_unit = None
-        return
+                draw_invalid_targets(screen, state.selected_unit, state.units, valid_targets)
+                draw_attack_range(screen, state.selected_unit, state.units)
+        elif state.current_phase == "CHARGE":
+            valid_targets = []
 
-    if current_phase == "CHARGE":
-        if attempt_charge(selected_unit, target):
+            for unit in state.units:
+                if can_charge_target(state.selected_unit, unit, charge_max_range):
+                    valid_targets.append(unit)
 
-            selected_unit.ap -= 2
+            draw_invalid_targets(screen, state.selected_unit, state.units, valid_targets)
+            draw_target_range(
+                screen,
+                state.selected_unit,
+                state.units,
+                charge_max_range,
+                (255, 140, 40, 120),
+            )
+        elif state.current_phase == "FIGHT":
+            valid_targets = []
 
-            mark_phase_action(selected_unit)
-            selected_unit = None
-        return
+            for unit in state.units:
+                if can_fight_target(state.selected_unit, unit):
+                    valid_targets.append(unit)
 
-    if current_phase == "FIGHT":
-        if dist > 1:
-            log_event("TARGET NOT IN MELEE RANGE!")
-            return
+            draw_invalid_targets(screen, state.selected_unit, state.units, valid_targets)
+            draw_target_range(
+                screen,
+                state.selected_unit,
+                state.units,
+                1,
+                (255, 60, 60, 140),
+            )
 
-        melee_attack(selected_unit, target)
-        selected_unit.ap -= 1
-        selected_unit.ap = max(0, selected_unit.ap)
+    for unit in state.units:
+        action_status = None
 
-        mark_phase_action(selected_unit)
+        if unit.team == state.current_team:
+            action_status = unit_action_status(
+                unit,
+                state.current_team,
+                state.current_phase,
+            )
 
-        remove_dead_units()
-        check_victory()
-        if selected_unit.ap <= 0:
-            selected_unit = None
+        unit.draw(
+            screen,
+            font,
+            selected=unit == state.selected_unit,
+            hovered=unit == state.hovered_target,
+            engaged=is_engaged(unit, state.units),
+            action_status=action_status,
+            status_font=small_font,
+        )
+
+    draw_objective_indicators(screen, small_font, state.units)
+    draw_effects(screen, font, state)
+    update_effects(state)
+    draw_floating_texts(screen, font, state)
+    update_floating_texts(state)
+
+    left_y, right_y = draw_sidebar(screen, small_font, state, mouse_pos=(mx, my))
+    left_y = draw_target_preview(screen, small_font, state, left_y)
+    right_y = draw_combat_log(screen, small_font, right_y)
+    draw_dice_log(screen, small_font, right_y)
+    draw_turn_header(screen, font, state)
+    draw_full_log_overlay(screen, font, small_font, state)
+    draw_victory_screen(screen, font, small_font, state)
+
+    if pause_menu_visible:
+        draw_pause_menu(
+            screen,
+            font,
+            small_font,
+            state,
+            app_settings["dice_delay_ms"],
+        )
+
+    draw_help_overlay(screen, font, small_font, state)
 
 
 running = True
 
 while running:
-    screen.fill(BLACK)
-    draw_grid(screen)
 
-    mx, my = pygame.mouse.get_pos()
-    hover_x = mx // CELL_SIZE
-    hover_y = my // CELL_SIZE
-    hovered_target = get_unit_at(hover_x, hover_y)
-
-    if selected_unit:
-        if current_phase == "MOVEMENT":
-            draw_movement_range(screen, selected_unit)
-        elif current_phase == "SHOOTING":
-            draw_attack_range(screen, selected_unit, units)
-
-    for unit in units:
-        unit.draw(
+    if start_screen_visible:
+        draw_start_screen(
             screen,
             font,
-            selected=unit == selected_unit,
-            hovered=unit == hovered_target,
-            engaged=is_engaged(unit, units),
+            small_font,
+            state.ai_orks_enabled,
+            app_settings["dice_delay_ms"],
         )
+    else:
+        draw_game()
 
-    draw_sidebar()
-    draw_target_preview()
-    draw_combat_log()
-    draw_dice_log()
-    draw_turn_header()
+        if (
+            state.ai_orks_enabled
+            and state.current_team == 2
+            and not state.full_log_visible
+            and not state.help_visible
+            and not pause_menu_visible
+        ):
+            # бот делает не весь ход сразу, для удобства
+            now = pygame.time.get_ticks()
+
+            if now >= state.ai_timer:
+                ai_take_turn_step(state)
+                state.ai_timer = now + ai_turn_delay_ms
 
     pygame.display.flip()
 
@@ -556,32 +451,126 @@ while running:
             running = False
 
         if event.type == pygame.KEYDOWN:
+            # Стартовый экран 
+            if start_screen_visible:
+                if event.key == pygame.K_1:
+                    state.ai_orks_enabled = False
+                    persist_ai_setting()
+                elif event.key == pygame.K_2:
+                    state.ai_orks_enabled = True
+                    persist_ai_setting()
+                elif event.key == pygame.K_LEFTBRACKET:
+                    adjust_dice_delay(-20)
+                elif event.key == pygame.K_RIGHTBRACKET:
+                    adjust_dice_delay(20)
+                elif event.key == pygame.K_RETURN:
+                    state.reset(ai_orks_enabled=state.ai_orks_enabled)
+                    start_screen_visible = False
+                continue
+
+            if event.key == pygame.K_ESCAPE:
+                # ESC сперва закрывает справку, а уже потом открывает/закрыва паузу
+                if state.help_visible:
+                    state.help_visible = False
+                    continue
+                if state.winner:
+                    continue
+                pause_menu_visible = not pause_menu_visible
+                continue
+
+            if state.winner:
+                if event.key == pygame.K_r:
+                    reset_game()
+                    start_screen_visible = True
+                elif event.key == pygame.K_m:
+                    start_screen_visible = True
+                    state.full_log_visible = False
+                continue
+
+            if pause_menu_visible:
+                if event.key == pygame.K_r:
+                    reset_game()
+                    pause_menu_visible = False
+                elif event.key == pygame.K_h:
+                    state.help_visible = not state.help_visible
+                elif event.key == pygame.K_m:
+                    start_screen_visible = True
+                    pause_menu_visible = False
+                    state.full_log_visible = False
+                elif event.key == pygame.K_i:
+                    toggle_ai()
+                elif event.key == pygame.K_LEFTBRACKET:
+                    adjust_dice_delay(-20)
+                elif event.key == pygame.K_RIGHTBRACKET:
+                    adjust_dice_delay(20)
+                continue
+
             if event.key == pygame.K_r:
                 reset_game()
+                start_screen_visible = True
             elif event.key == pygame.K_RETURN:
-                advance_phase()
+                ready_count = 0
+
+                for unit in state.units:
+                    if unit.team == state.current_team:
+                        if unit_can_act(unit, state.current_phase):
+                            ready_count += 1
+
+                if ready_count > 0:
+                    log_event(f"Готовых отрядов: {ready_count}")
+
+                state.advance_phase()
             elif event.key == pygame.K_SPACE:
-                activate_waaagh()
+                state.activate_waaagh()
+            elif event.key == pygame.K_l:
+                state.full_log_visible = not state.full_log_visible
+            elif event.key == pygame.K_h:
+                state.help_visible = not state.help_visible
+            elif event.key == pygame.K_i:
+                toggle_ai()
+            elif event.key == pygame.K_LEFTBRACKET:
+                adjust_dice_delay(-20)
+            elif event.key == pygame.K_RIGHTBRACKET:
+                adjust_dice_delay(20)
 
-        if event.type == pygame.MOUSEBUTTONDOWN:
-            if winner:
+        if (
+            event.type == pygame.MOUSEBUTTONDOWN
+            and not start_screen_visible
+            and not pause_menu_visible
+            and not state.help_visible
+        ):
+            if state.winner:
                 continue
 
-            if NEXT_PHASE_RECT.collidepoint(event.pos):
-                advance_phase()
+            if state.ai_orks_enabled and state.current_team == 2:
                 continue
 
-            if WAAAGH_RECT.collidepoint(event.pos):
-                activate_waaagh()
+            if next_phase_rect.collidepoint(event.pos):
+                state.advance_phase()
                 continue
 
-            if event.pos[0] >= GAME_WIDTH:
+            if waaagh_rect.collidepoint(event.pos):
+                state.activate_waaagh()
                 continue
 
-            handle_board_click(
-                event.pos[0] // CELL_SIZE,
-                event.pos[1] // CELL_SIZE,
-            )
+            if event.pos[0] >= game_width:
+                roster_unit = get_sidebar_roster_unit_at(event.pos, state)
+
+                if (
+                    roster_unit
+                    and roster_unit.team == state.current_team
+                    and unit_can_act(roster_unit, state.current_phase)
+                ):
+                    state.selected_unit = roster_unit
+
+                continue
+
+            clicked_hex = pixel_to_hex(*event.pos)
+
+            if not clicked_hex:
+                continue
+
+            handle_board_click(*clicked_hex)
 
     clock.tick(60)
 

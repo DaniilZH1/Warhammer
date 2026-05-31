@@ -1,3 +1,4 @@
+﻿# Тут описаны параметры оружия.
 class Weapon:
     def __init__(
         self,
@@ -40,6 +41,27 @@ plasma_gun = Weapon(
     weapon_range=5,
 )
 
+heavy_bolter = Weapon(
+    "Heavy Bolter",
+    attacks=3,
+    strength=5,
+    ap=-1,
+    damage=2,
+    weapon_range=6,
+    special_rules=[
+        "sustained_hits",
+    ],
+)
+
+bolt_pistol = Weapon(
+    "Bolt Pistol",
+    attacks=1,
+    strength=4,
+    ap=0,
+    damage=1,
+    weapon_range=2,
+)
+
 shoota = Weapon(
     "Shoota",
     attacks=3,
@@ -47,4 +69,22 @@ shoota = Weapon(
     ap=0,
     damage=1,
     weapon_range=3,
+)
+
+slugga = Weapon(
+    "Slugga",
+    attacks=1,
+    strength=4,
+    ap=0,
+    damage=1,
+    weapon_range=2,
+)
+
+rokkit_launcha = Weapon(
+    "Rokkit Launcha",
+    attacks=1,
+    strength=8,
+    ap=-2,
+    damage=3,
+    weapon_range=5,
 )

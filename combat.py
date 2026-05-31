@@ -1,20 +1,32 @@
-import random
+﻿import random
 import builtins
-
 import pygame
 
-from board import is_in_cover
+from board import is_blocked, is_in_cover
 
+# Тут бросаются кубики и считается урон.
 dice_log = []
 combat_log = []
+dice_delay_ms = 80
+
+
+def set_dice_delay(delay_ms):
+    global dice_delay_ms
+
+    dice_delay_ms = int(delay_ms)
+
+    if dice_delay_ms < 0:
+        dice_delay_ms = 0
 
 
 def log_event(message):
+    # Добавляем строку в лог боя.
     builtins.print(message)
     combat_log.append(str(message))
 
     if len(combat_log) > 12:
-        del combat_log[:-12]
+        while len(combat_log) > 12:
+            combat_log.pop(0)
 
 
 def dice_to_symbol(value):
@@ -25,16 +37,28 @@ def roll_d6():
     return random.randint(1, 6)
 
 
-def morale_test(unit):
+def morale_test(unit, models_lost=1):
+    # Проверяем мораль отряда.
     roll = roll_d6()
+    lost = models_lost
 
-    log_event(f"MORALE TEST: {roll}")
+    if lost < 1:
+        lost = 1
 
-    if roll <= 2:
+    needed = 2 + lost
+
+    if needed > 6:
+        needed = 6
+
+    log_event(f"Мораль: {roll} (нужно {needed}+)")
+
+    if roll < needed:
         unit.broken = True
-        log_event("MORALE FAILED!")
+        log_event("Мораль провалена!")
+        return False
     else:
-        log_event("MORALE PASSED!")
+        log_event("Мораль успешна!")
+        return True
 
 
 def wound_roll_needed(strength, toughness):
@@ -54,22 +78,68 @@ def wound_roll_needed(strength, toughness):
 
 
 def update_model_count(unit):
-    unit.hp = max(0, unit.hp)
-    unit.models = max(
-        0,
-        (unit.hp + unit.hp_per_model - 1) // unit.hp_per_model,
-    )
+    # После урона пересчитываем, сколько моделей осталось.
+    if unit.hp < 0:
+        unit.hp = 0
+
+    unit.models = (unit.hp + unit.hp_per_model - 1) // unit.hp_per_model
+
+    if unit.models < 0:
+        unit.models = 0
+
+
+def model_ratio(unit):
+    if hasattr(unit, "max_models"):
+        max_models = unit.max_models
+    else:
+        max_models = unit.models
+
+    if max_models < 1:
+        max_models = 1
+
+    models = unit.models
+
+    if models < 0:
+        models = 0
+
+    return models / max_models
+
+
+def scaled_attack_count(unit, base_attacks):
+    # Если моделей стало меньше, атак тоже становится меньше.
+    if unit.models <= 0:
+        return 0
+
+    attacks = int(base_attacks * model_ratio(unit))
+
+    if attacks < base_attacks * model_ratio(unit):
+        attacks += 1
+
+    if attacks < 1:
+        attacks = 1
+
+    return attacks
+
+
+def effective_weapon_attacks(unit):
+    return scaled_attack_count(unit, unit.weapon.attacks)
+
+
+def effective_melee_attacks(unit):
+    return scaled_attack_count(unit, unit.melee_attacks)
 
 
 def attack(attacker, target, waaagh=False):
-    log_event("=== ATTACK ===")
+    # Тут полностью считается стрельба.
+    log_event("=== Стрельба ===")
 
     total_damage = 0
     bonus_attacks = 0
+    base_attacks = effective_weapon_attacks(attacker)
 
     if waaagh:
         bonus_attacks += 1
-        log_event("WAAAGH BONUS ATTACK!")
+        log_event("WAAAGH: бонусная атака!")
 
     distance_to_target = abs(attacker.x - target.x) + abs(attacker.y - target.y)
 
@@ -77,68 +147,72 @@ def attack(attacker, target, waaagh=False):
         "rapid_fire" in attacker.weapon.special_rules
         and distance_to_target <= attacker.weapon.weapon_range // 2
     ):
-        bonus_attacks += attacker.weapon.attacks
-        log_event("RAPID FIRE!")
+        bonus_attacks += base_attacks
+        log_event("Быстрый огонь!")
 
     dice_log.clear()
 
-    total_attacks = attacker.weapon.attacks + bonus_attacks
+    total_attacks = base_attacks + bonus_attacks
+    log_event(f"Атак: {total_attacks}")
 
     for shot in range(total_attacks):
-        log_event(f"SHOT {shot + 1}")
+        log_event(f"Выстрел {shot + 1}")
 
         hit_roll = roll_d6()
         dice_log.append(("HIT", hit_roll))
         pygame.display.flip()
-        pygame.time.delay(300)
+        pygame.time.delay(dice_delay_ms)
 
-        log_event(f"Hit roll: {hit_roll}")
+        log_event(f"Бросок попадания: {hit_roll}")
 
         extra_hits = 0
 
         if hit_roll == 6 and "sustained_hits" in attacker.weapon.special_rules:
             extra_hits += 1
-            log_event("SUSTAINED HIT!")
+            log_event("Доп. попадание!")
 
         if hit_roll < attacker.ballistic_skill:
-            log_event("MISS!")
+            log_event("Промах!")
             continue
 
-        log_event("HIT!")
+        log_event("Попадание!")
 
         for _ in range(1 + extra_hits):
             needed = wound_roll_needed(attacker.weapon.strength, target.toughness)
             wound_roll = roll_d6()
             dice_log.append(("WOUND", wound_roll))
             pygame.display.flip()
-            pygame.time.delay(300)
+            pygame.time.delay(dice_delay_ms)
 
-            log_event(f"Wound roll: {wound_roll} (need {needed}+)")
+            log_event(f"Бросок ранения: {wound_roll} (нужно {needed}+)")
 
             if wound_roll < needed:
-                log_event("FAILED TO WOUND!")
+                log_event("Не ранил!")
                 continue
 
-            log_event("WOUND!")
+            log_event("Ранение!")
 
             modified_save = target.armor_save - attacker.weapon.ap
 
             if is_in_cover(target):
                 modified_save -= 1
-                log_event("TARGET IN COVER! +1 SAVE")
+                log_event("Цель в укрытии! +1 сейв")
 
-            modified_save = min(modified_save, 6)
-            modified_save = max(modified_save, 2)
+            if modified_save > 6:
+                modified_save = 6
+
+            if modified_save < 2:
+                modified_save = 2
 
             save_roll = roll_d6()
             dice_log.append(("SAVE", save_roll))
             pygame.display.flip()
-            pygame.time.delay(300)
+            pygame.time.delay(dice_delay_ms)
 
-            log_event(f"Armor save: {save_roll} (need {modified_save}+)")
+            log_event(f"Сейв брони: {save_roll} (нужно {modified_save}+)")
 
             if save_roll >= modified_save:
-                log_event("SAVED!")
+                log_event("Спасено!")
                 continue
 
             old_models = target.models
@@ -147,44 +221,48 @@ def attack(attacker, target, waaagh=False):
 
             if target.models < old_models:
                 lost = old_models - target.models
-                log_event(f"{lost} MODEL LOST!")
-                morale_test(target)
+                log_event(f"Потеряно моделей: {lost}")
+                morale_test(target, lost)
 
             total_damage += attacker.weapon.damage
-            log_event(f"DAMAGE: {attacker.weapon.damage}")
+            log_event(f"Урон: {attacker.weapon.damage}")
 
-    log_event(f"TOTAL DAMAGE: {total_damage}")
-    log_event(f"TARGET HP: {target.hp}")
+    log_event(f"Всего урона: {total_damage}")
+    log_event(f"HP цели: {target.hp}")
 
 
 def melee_attack(attacker, target):
-    log_event("=== MELEE ATTACK ===")
+    # Тут считается ближний бой.
+    log_event("=== Ближний бой ===")
 
-    for attack_num in range(attacker.melee_attacks):
-        log_event(f"MELEE HIT {attack_num + 1}")
+    total_attacks = effective_melee_attacks(attacker)
+    log_event(f"Атак в бою: {total_attacks}")
+
+    for attack_num in range(total_attacks):
+        log_event(f"Удар {attack_num + 1}")
 
         hit_roll = roll_d6()
-        log_event(f"Hit roll: {hit_roll}")
+        log_event(f"Бросок попадания: {hit_roll}")
 
         if hit_roll < attacker.melee_skill:
-            log_event("MISS!")
+            log_event("Промах!")
             continue
 
-        log_event("HIT!")
+        log_event("Попадание!")
 
-        wound_needed = wound_roll_needed(4, target.toughness)
+        wound_needed = wound_roll_needed(attacker.melee_strength, target.toughness)
         wound_roll = roll_d6()
-        log_event(f"Wound roll: {wound_roll}")
+        log_event(f"Бросок ранения: {wound_roll}")
 
         if wound_roll < wound_needed:
-            log_event("FAILED TO WOUND!")
+            log_event("Не ранил!")
             continue
 
         save_roll = roll_d6()
-        log_event(f"Save roll: {save_roll}")
+        log_event(f"Бросок сейва: {save_roll}")
 
         if save_roll >= target.armor_save:
-            log_event("SAVED!")
+            log_event("Спасено!")
             continue
 
         old_models = target.models
@@ -193,39 +271,52 @@ def melee_attack(attacker, target):
         update_model_count(target)
 
         if target.models < old_models:
-            morale_test(target)
+            lost = old_models - target.models
+            log_event(f"Потеряно моделей: {lost}")
+            morale_test(target, lost)
 
-        log_event("MELEE DAMAGE!")
+        log_event("Урон в ближнем бою!")
 
 
 def attempt_charge(attacker, target):
-    log_event("=== CHARGE ===")
+    # Тут считается, получилось ли добежать до врага.
+    from rules import distance, is_inside_grid, neighbors
+
+    log_event("=== Натиск ===")
 
     charge_roll = roll_d6()
-    log_event(f"Charge roll: {charge_roll}")
+    log_event(f"Бросок натиска: {charge_roll}")
 
-    distance = abs(attacker.x - target.x) + abs(attacker.y - target.y)
+    charge_distance = distance(attacker.x, attacker.y, target.x, target.y)
 
-    if charge_roll < distance:
-        log_event("CHARGE FAILED!")
+    if charge_roll < charge_distance:
+        log_event("Натиск провален!")
         return False
 
-    log_event("CHARGE SUCCESS!")
+    log_event("Натиск успешен!")
 
     attacker.has_charged = True
+    charge_tiles = []
 
-    if attacker.x < target.x:
-        attacker.x = target.x - 1
-        attacker.y = target.y
-    elif attacker.x > target.x:
-        attacker.x = target.x + 1
-        attacker.y = target.y
-    elif attacker.y < target.y:
-        attacker.y = target.y - 1
-        attacker.x = target.x
-    elif attacker.y > target.y:
-        attacker.y = target.y + 1
-        attacker.x = target.x
+    for tile in neighbors(target.x, target.y):
+        tile_x, tile_y = tile
+
+        if is_inside_grid(tile_x, tile_y):
+            if not is_blocked(tile_x, tile_y):
+                charge_tiles.append(tile)
+
+    if charge_tiles:
+        best_tile = None
+        best_distance = None
+
+        for tile in charge_tiles:
+            tile_distance = distance(attacker.x, attacker.y, tile[0], tile[1])
+
+            if best_tile is None or tile_distance < best_distance:
+                best_tile = tile
+                best_distance = tile_distance
+
+        attacker.x, attacker.y = best_tile
 
     return True
 
@@ -247,6 +338,8 @@ def save_chance(save):
 
 
 def is_engaged(unit, units):
+    from rules import distance
+
     for other in units:
         if other == unit:
             continue
@@ -254,9 +347,7 @@ def is_engaged(unit, units):
         if other.team == unit.team:
             continue
 
-        distance = abs(unit.x - other.x) + abs(unit.y - other.y)
-
-        if distance <= 1:
+        if distance(unit.x, unit.y, other.x, other.y) <= 1:
             return True
 
     return False
